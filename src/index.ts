@@ -317,41 +317,87 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
     return err('Invalid JSON body');
   }
 
-  const keyword = body.keyword as string;
-  if (!keyword?.trim()) return err('keyword is required');
+  const keyword = typeof body.keyword === 'string' ? body.keyword.trim() : '';
+  if (!keyword) return err('keyword is required');
 
-  const page    = Number(body.page ?? 1);
-  const perPage = Number(body.perPage ?? 20);
+  const page = Math.max(1, Number(body.page ?? 1) || 1);
+  const perPage = Math.min(20, Math.max(1, Number(body.perPage ?? 20) || 20));
 
   const data = await fetchWithHostPool<MBSearchData>(
     env, PATHS.search, 'POST', undefined,
     { keyword, page, perPage, subjectType: 0 }
   );
 
-  if (!data) return json({ items: [], pager: null });
+  // Do not turn upstream failures into a misleading successful empty search.
+  // A 502 makes the actual API problem visible to the bot and its logs.
+  if (!data) {
+    return json({
+      error: 'MovieBox upstream search failed. Check the Worker logs for host/auth errors.',
+      keyword
+    }, 502);
+  }
 
-  const items = (data.items || [])
-    .filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType))
-    .filter((item) => !isNonEnglishDub(item.title, item.language))
-    .map((item) => ({
-      subjectId:   item.subjectId,
-      subjectType: item.subjectType,
-      title:       item.title,
-      description: item.description ?? '',
-      releaseDate: item.releaseDate ?? null,
-      duration:    item.duration ?? null,
-      genre:       item.genre ?? null,
-      poster:      item.cover?.url ?? null,
-      thumbnail:   item.cover?.thumbnail ?? null,
-      country:     item.countryName ?? null,
-      rating:      item.imdbRatingValue && item.imdbRatingValue !== '0'
-                     ? parseFloat(item.imdbRatingValue)
-                     : null,
-      language:    item.language ?? null,
-      type:        resolveSubjectType(item.subjectType),
-    }));
+  // MovieBox has returned slightly different search shapes across app/API
+  // revisions. Accept the known list containers and normalize numeric IDs/types.
+  const raw = data as unknown as Record<string, any>;
+  const rawItems: any[] = Array.isArray(raw.items) ? raw.items
+    : Array.isArray(raw.list) ? raw.list
+    : Array.isArray(raw.subjects) ? raw.subjects
+    : Array.isArray(raw.results) ? raw.results
+    : [];
 
-  return json({ items, pager: data.pager });
+  const items = rawItems
+    .filter((item) => item && typeof item === 'object')
+    .filter((item) => String(item.subjectId ?? item.subject_id ?? item.id ?? '').trim() !== '')
+    .filter((item) => String(item.title ?? item.name ?? '').trim() !== '')
+    // Some responses serialize subjectType as a string. Treat a missing/unknown
+    // type as a movie for display rather than silently dropping every result.
+    .map((item) => {
+      const parsedType = Number(item.subjectType ?? item.subject_type ?? item.typeId);
+      const subjectType = ALLOWED_SUBJECT_TYPES.has(parsedType) ? parsedType : 1;
+      const cover = item.cover;
+      const poster = (typeof cover === 'string' ? cover : cover?.url)
+        ?? item.poster
+        ?? item.posterUrl
+        ?? item.image?.url
+        ?? null;
+      const thumbnail = (typeof cover === 'object' && cover ? cover.thumbnail : null)
+        ?? item.thumbnail
+        ?? null;
+      const ratingValue = item.imdbRatingValue ?? item.rating;
+      const rating = ratingValue && String(ratingValue) !== '0' && Number.isFinite(Number(ratingValue))
+        ? Number(ratingValue)
+        : null;
+
+      return {
+        subjectId: String(item.subjectId ?? item.subject_id ?? item.id),
+        subjectType,
+        title: String(item.title ?? item.name).trim(),
+        description: item.description ?? '',
+        releaseDate: item.releaseDate ?? item.release_date ?? null,
+        duration: item.duration ?? null,
+        genre: item.genre ?? null,
+        poster,
+        thumbnail,
+        country: item.countryName ?? item.country ?? null,
+        rating,
+        language: item.language ?? null,
+        type: resolveSubjectType(subjectType),
+      };
+    });
+
+  // Don't silently filter out all titles based on locale/dub labels. Return the
+  // results MovieBox provided; users can pick the language/version they need.
+  return json({
+    items,
+    pager: raw.pager ?? null,
+    debug: {
+      keyword,
+      rawCount: rawItems.length,
+      returnedCount: items.length,
+      responseKeys: Object.keys(raw),
+    },
+  });
 }
 
 async function handleInfo(subjectId: string, env: Env): Promise<Response> {
