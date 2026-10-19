@@ -14,12 +14,9 @@ NIGERIA_IP = "197.211.52.65"
 # KV rather than memory since Cloudflare does not reliably reuse the same
 # isolate across requests. If you already created this namespace for the H5
 # worker variant, reuse the same id here — same KV store, different key.
-# Create with:
-#   wrangler kv namespace create MOVIEBOX_SESSION_KV
-# then paste the returned id below.
 [[kv_namespaces]]
 binding = "MOVIEBOX_SESSION_KV"
-id = "fe2b5cabe85248259cc65eccd84b9e4b"
+id = "14aa8ea39dec43698c99e86d978f8bfa"
 
 # [[routes]]
 # # Update with your actual Cloudflare zone if using custom domain
