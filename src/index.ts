@@ -292,6 +292,8 @@ function normalizeH5Subject(item: H5Subject) {
 const H5_API_BASE = 'https://h5-api.aoneroom.com';
 const H5_TOKEN_KEY = 'h5_auth_token';
 const H5_TOKEN_KV_TTL = 60 * 60 * 24;
+const H5_COOLDOWN_KEY = 'h5_rate_limit_until';
+const H5_DEFAULT_COOLDOWN_SECONDS = 300;
 // Match the current H5 web-client request headers used by the public frontend.
 const H5_CLIENT_INFO = JSON.stringify({ timezone: 'Africa/Nairobi' });
 const H5_USER_AGENT =
@@ -328,6 +330,52 @@ async function saveH5Token(env: Env, token: string): Promise<void> {
     );
   } catch (error) {
     console.warn(`[H5 Auth] Could not cache H5 token in KV: ${error}`);
+  }
+}
+
+function retryAfterSeconds(response: Response): number {
+  const raw = response.headers.get('retry-after');
+  if (raw) {
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds);
+    const date = Date.parse(raw);
+    if (Number.isFinite(date)) return Math.max(1, Math.ceil((date - Date.now()) / 1000));
+  }
+  const resetRaw = response.headers.get('ratelimit-reset');
+  if (resetRaw) {
+    const reset = Number(resetRaw);
+    if (Number.isFinite(reset) && reset > 0) return Math.ceil(reset);
+  }
+  return H5_DEFAULT_COOLDOWN_SECONDS;
+}
+
+async function saveH5Cooldown(env: Env, seconds: number): Promise<number> {
+  // Honour upstream Retry-After where present; bound the KV TTL to a safe range.
+  const bounded = Math.max(60, Math.min(3600, Math.ceil(seconds)));
+  const until = Date.now() + bounded * 1000;
+  try {
+    await env.MOVIEBOX_SESSION_KV.put(
+      H5_COOLDOWN_KEY,
+      String(until),
+      { expirationTtl: bounded }
+    );
+  } catch (error) {
+    console.warn(`[H5 Rate Limit] Could not save cooldown to KV: ${error}`);
+  }
+  console.warn(`[H5 Rate Limit] Upstream returned HTTP 429; avoiding further requests for ${bounded}s`);
+  return bounded;
+}
+
+async function getH5CooldownRemaining(env: Env): Promise<number> {
+  try {
+    const raw = await env.MOVIEBOX_SESSION_KV.get(H5_COOLDOWN_KEY);
+    if (!raw) return 0;
+    const until = Number(raw);
+    if (!Number.isFinite(until) || until <= Date.now()) return 0;
+    return Math.ceil((until - Date.now()) / 1000);
+  } catch (error) {
+    console.warn(`[H5 Rate Limit] Could not read cooldown from KV: ${error}`);
+    return 0;
   }
 }
 
@@ -403,12 +451,21 @@ async function sendH5Request(
     signal: AbortSignal.timeout(12000),
   });
 
+  if (response.status === 429) {
+    await saveH5Cooldown(env, retryAfterSeconds(response));
+  }
+
   const rotatedToken = readXUserToken(response);
   if (rotatedToken) await saveH5Token(env, rotatedToken);
   return response;
 }
 
 async function bootstrapH5Token(env: Env): Promise<string | null> {
+  const remaining = await getH5CooldownRemaining(env);
+  if (remaining > 0) {
+    console.warn(`[H5 Auth] Skipping bootstrap; upstream rate-limit cooldown has ${remaining}s remaining`);
+    return null;
+  }
   // These guest endpoints return the anonymous bearer in the x-user response header.
   const urls = [
     `${H5_API_BASE}/wefeed-h5api-bff/country-code`,
@@ -427,6 +484,7 @@ async function bootstrapH5Token(env: Env): Promise<string | null> {
       }
       const responseText = (await response.clone().text()).slice(0, 160).replace(/\s+/g, ' ');
       console.warn(`[H5 Auth] ${new URL(url).pathname} returned no x-user token (HTTP ${response.status}); body=${responseText}`);
+      if (response.status === 429) break;
     } catch (error) {
       console.warn(`[H5 Auth] Bootstrap request failed: ${error}`);
     }
@@ -446,6 +504,11 @@ async function fetchH5Search(
   page: number,
   perPage: number
 ): Promise<Record<string, any> | null> {
+  const remaining = await getH5CooldownRemaining(env);
+  if (remaining > 0) {
+    console.warn(`[H5 Search] Skipping search; upstream rate-limit cooldown has ${remaining}s remaining`);
+    return null;
+  }
   const endpoints = [
     `${H5_API_BASE}/wefeed-h5api-bff/subject/search`,
     'https://h5.aoneroom.com/wefeed-h5api-bff/subject/search',
@@ -458,6 +521,10 @@ async function fetchH5Search(
       if (!token) return null;
 
       let response = await sendH5Request(env, endpoint, 'POST', body, token);
+
+      // A 429 is an explicit upstream rate limit: preserve it and do not retry
+      // another endpoint during the same cooldown window.
+      if (response.status === 429) return null;
 
       // Refresh an expired anonymous token and retry once.
       if ([401, 403, 440].includes(response.status)) {
@@ -538,6 +605,14 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
   const data = await fetchH5Search(env, keyword, page, perPage);
 
   if (!data) {
+    const retryAfterSeconds = await getH5CooldownRemaining(env);
+    if (retryAfterSeconds > 0) {
+      return json({
+        error: 'MovieBox upstream rate limit reached. Retry after the cooldown.',
+        keyword,
+        retryAfterSeconds,
+      }, 429);
+    }
     return json({
       error: 'MovieBox H5 search endpoints failed. Check the Worker logs for [H5 Search] errors.',
       keyword
