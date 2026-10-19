@@ -205,7 +205,6 @@ async function attemptHostPool<T>(
         },
         body: bodyStr ?? undefined,
         signal: AbortSignal.timeout(12000),
-        cache: 'no-store',
       } as any);
 
       sawAnyResponse = true;
