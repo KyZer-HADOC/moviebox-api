@@ -19,7 +19,6 @@
 import {
   fetchWithHostPool,
   PATHS,
-  type MBSearchData,
   type MBDetailData,
   type MBSeasonData,
   type MBResourceData,
@@ -286,6 +285,69 @@ function normalizeH5Subject(item: H5Subject) {
   };
 }
 
+// ─── H5 search client ─────────────────────────────────────────────────────────
+// Search through MovieBox's H5 catalogue endpoint rather than the Android
+// endpoint, whose auth bootstrap can be rejected with HTTP 440. This is for
+// metadata/search results only; detail/resource endpoints continue using the
+// signed Android client below.
+
+const H5_SEARCH_ENDPOINTS = [
+  'https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search',
+  'https://h5.aoneroom.com/wefeed-h5api-bff/subject/search',
+];
+
+async function fetchH5Search(
+  keyword: string,
+  page: number,
+  perPage: number
+): Promise<Record<string, any> | null> {
+  for (const endpoint of H5_SEARCH_ENDPOINTS) {
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json, text/plain, */*',
+          'Content-Type': 'application/json',
+          'X-Client-Info': JSON.stringify({ timezone: 'Africa/Lagos' }),
+          'X-Request-Lang': 'en',
+          'Referer': 'https://h5-api.aoneroom.com/',
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0',
+        },
+        body: JSON.stringify({ keyword, page, perPage, subjectType: 0 }),
+        signal: AbortSignal.timeout(12000),
+      });
+
+      if (!response.ok) {
+        console.warn(`[H5 Search] ${endpoint} returned HTTP ${response.status} — trying next`);
+        continue;
+      }
+
+      const envelope = await response.json() as Record<string, any>;
+      if (envelope.code !== undefined && Number(envelope.code) !== 0) {
+        console.warn(`[H5 Search] ${endpoint} returned API code ${envelope.code}: ${envelope.message ?? ''} — trying next`);
+        continue;
+      }
+
+      const data = envelope.data && typeof envelope.data === 'object'
+        ? envelope.data as Record<string, any>
+        : envelope;
+
+      // Some API builds wrap the catalogue object in a second data property.
+      const unwrapped = data.data && typeof data.data === 'object'
+        ? data.data as Record<string, any>
+        : data;
+
+      console.log(`[H5 Search] Search succeeded via ${endpoint}`);
+      return unwrapped;
+    } catch (error) {
+      console.warn(`[H5 Search] ${endpoint} failed: ${error} — trying next`);
+    }
+  }
+
+  console.error('[H5 Search] All search endpoints failed');
+  return null;
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 function handleRoot(): Response {
@@ -309,7 +371,7 @@ function handleRoot(): Response {
   });
 }
 
-async function handleSearch(request: Request, env: Env): Promise<Response> {
+async function handleSearch(request: Request): Promise<Response> {
   let body: Record<string, unknown>;
   try {
     body = await request.json() as Record<string, unknown>;
@@ -323,23 +385,19 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
   const page = Math.max(1, Number(body.page ?? 1) || 1);
   const perPage = Math.min(20, Math.max(1, Number(body.perPage ?? 20) || 20));
 
-  const data = await fetchWithHostPool<MBSearchData>(
-    env, PATHS.search, 'POST', undefined,
-    { keyword, page, perPage, subjectType: 0 }
-  );
+  // H5 search avoids the mobile API's bearer-token bootstrap, which currently
+  // receives HTTP 440 across the Android host pool.
+  const data = await fetchH5Search(keyword, page, perPage);
 
-  // Do not turn upstream failures into a misleading successful empty search.
-  // A 502 makes the actual API problem visible to the bot and its logs.
   if (!data) {
     return json({
-      error: 'MovieBox upstream search failed. Check the Worker logs for host/auth errors.',
+      error: 'MovieBox H5 search endpoints failed. Check the Worker logs for [H5 Search] errors.',
       keyword
     }, 502);
   }
 
-  // MovieBox has returned slightly different search shapes across app/API
-  // revisions. Accept the known list containers and normalize numeric IDs/types.
-  const raw = data as unknown as Record<string, any>;
+  // Accept known list containers and normalize numeric IDs/types.
+  const raw = data;
   const rawItems: any[] = Array.isArray(raw.items) ? raw.items
     : Array.isArray(raw.list) ? raw.list
     : Array.isArray(raw.subjects) ? raw.subjects
@@ -693,7 +751,7 @@ export default {
 
     // POST /search
     if (path === '/search' && request.method === 'POST') {
-      return handleSearch(request, env);
+      return handleSearch(request);
     }
 
     // GET /info/:subjectId
