@@ -24,7 +24,7 @@ import {
   type MBResourceData,
   type MBResourceItem,
 } from './moviebox.js';
-import type { SigningEnv } from './signing.js';
+import { generateClientToken, generateSignature, type SigningEnv } from './signing.js';
 
 // subjectType: 1=movie, 2=tv, 7=shorts — all others filtered out
 const ALLOWED_SUBJECT_TYPES = new Set([1, 2, 7]);
@@ -286,58 +286,197 @@ function normalizeH5Subject(item: H5Subject) {
 }
 
 // ─── H5 search client ─────────────────────────────────────────────────────────
-// Search through MovieBox's H5 catalogue endpoint rather than the Android
-// endpoint, whose auth bootstrap can be rejected with HTTP 440. This is for
-// metadata/search results only; detail/resource endpoints continue using the
-// signed Android client below.
+// The Android API host pool currently returns HTTP 440 during anonymous-token
+// bootstrap. Use MovieBox's H5 catalogue API with its signed anonymous bootstrap.
 
-const H5_SEARCH_ENDPOINTS = [
-  'https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search',
-  'https://h5.aoneroom.com/wefeed-h5api-bff/subject/search',
-];
+const H5_API_BASE = 'https://h5-api.aoneroom.com';
+const H5_TOKEN_KEY = 'h5_auth_token';
+const H5_TOKEN_KV_TTL = 60 * 60 * 24;
+const H5_CLIENT_INFO = JSON.stringify({ timezone: 'Asia/Colombo' });
+const H5_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
+
+interface H5CachedToken {
+  token: string;
+  expiresAtSeconds: number;
+}
+
+function readJwtExp(token: string): number | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    const payloadText = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = payloadText + '='.repeat((4 - (payloadText.length % 4)) % 4);
+    const payload = JSON.parse(atob(padded)) as { exp?: number };
+    return typeof payload.exp === 'number' ? payload.exp : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveH5Token(env: Env, token: string): Promise<void> {
+  const expiresAtSeconds =
+    readJwtExp(token) ?? Math.floor(Date.now() / 1000) + 3600;
+  const value: H5CachedToken = { token, expiresAtSeconds };
+  try {
+    await env.MOVIEBOX_SESSION_KV.put(
+      H5_TOKEN_KEY,
+      JSON.stringify(value),
+      { expirationTtl: H5_TOKEN_KV_TTL }
+    );
+  } catch (error) {
+    console.warn(`[H5 Auth] Could not cache H5 token in KV: ${error}`);
+  }
+}
+
+async function readH5Token(env: Env): Promise<string | null> {
+  try {
+    const raw = await env.MOVIEBOX_SESSION_KV.get(H5_TOKEN_KEY);
+    if (!raw) return null;
+    const cached = JSON.parse(raw) as H5CachedToken;
+    if (cached.token && cached.expiresAtSeconds > Math.floor(Date.now() / 1000) + 60) {
+      return cached.token;
+    }
+  } catch (error) {
+    console.warn(`[H5 Auth] Could not read H5 token from KV: ${error}`);
+  }
+  return null;
+}
+
+async function invalidateH5Token(env: Env): Promise<void> {
+  try {
+    await env.MOVIEBOX_SESSION_KV.delete(H5_TOKEN_KEY);
+  } catch (error) {
+    console.warn(`[H5 Auth] Could not invalidate H5 token in KV: ${error}`);
+  }
+}
+
+function readXUserToken(response: Response): string | null {
+  const value = response.headers.get('x-user');
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as { token?: string };
+    return typeof parsed.token === 'string' && parsed.token ? parsed.token : null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendH5Request(
+  env: Env,
+  url: string,
+  method: 'GET' | 'POST',
+  body: string | null,
+  bearerToken: string | null
+): Promise<Response> {
+  const timestamp = Date.now();
+  const accept = 'application/json';
+  const contentType = body !== null ? 'application/json; charset=utf-8' : '';
+  const headers: Record<string, string> = {
+    'Accept': accept,
+    'User-Agent': H5_USER_AGENT,
+    'Referer': 'https://themoviebox.org/',
+    'X-Client-Token': await generateClientToken(timestamp),
+    'x-tr-signature': await generateSignature(
+      method, accept, contentType, url, body, timestamp
+    ),
+    'X-Client-Info': H5_CLIENT_INFO,
+    'x-request-lang': 'en',
+    'X-Client-Status': '0',
+  };
+  if (body !== null) headers['Content-Type'] = contentType;
+  if (bearerToken) headers['Authorization'] = `Bearer ${bearerToken}`;
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body ?? undefined,
+    signal: AbortSignal.timeout(12000),
+  });
+
+  const rotatedToken = readXUserToken(response);
+  if (rotatedToken) await saveH5Token(env, rotatedToken);
+  return response;
+}
+
+async function bootstrapH5Token(env: Env): Promise<string | null> {
+  // These guest endpoints return the anonymous bearer in the x-user response header.
+  const urls = [
+    `${H5_API_BASE}/wefeed-h5api-bff/country-code`,
+    `${H5_API_BASE}/wefeed-h5api-bff/home?host=themoviebox.org`,
+    `${H5_API_BASE}/wefeed-h5api-bff/home?host=moviebox.ph`,
+  ];
+
+  for (const url of urls) {
+    try {
+      const response = await sendH5Request(env, url, 'GET', null, null);
+      const token = readXUserToken(response);
+      if (token) {
+        await saveH5Token(env, token);
+        console.log(`[H5 Auth] Anonymous token bootstrap succeeded (HTTP ${response.status})`);
+        return token;
+      }
+      console.warn(`[H5 Auth] ${new URL(url).pathname} returned no x-user token (HTTP ${response.status})`);
+    } catch (error) {
+      console.warn(`[H5 Auth] Bootstrap request failed: ${error}`);
+    }
+  }
+
+  console.error('[H5 Auth] Could not obtain an anonymous H5 token from bootstrap endpoints');
+  return null;
+}
+
+async function getH5Token(env: Env): Promise<string | null> {
+  return (await readH5Token(env)) ?? (await bootstrapH5Token(env));
+}
 
 async function fetchH5Search(
+  env: Env,
   keyword: string,
   page: number,
   perPage: number
 ): Promise<Record<string, any> | null> {
-  for (const endpoint of H5_SEARCH_ENDPOINTS) {
+  const endpoints = [
+    `${H5_API_BASE}/wefeed-h5api-bff/subject/search`,
+    'https://h5.aoneroom.com/wefeed-h5api-bff/subject/search',
+  ];
+  const body = JSON.stringify({ keyword, page, perPage, subjectType: 0 });
+
+  for (const endpoint of endpoints) {
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json, text/plain, */*',
-          'Content-Type': 'application/json',
-          'X-Client-Info': JSON.stringify({ timezone: 'Africa/Lagos' }),
-          'X-Request-Lang': 'en',
-          'Referer': 'https://h5-api.aoneroom.com/',
-          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0',
-        },
-        body: JSON.stringify({ keyword, page, perPage, subjectType: 0 }),
-        signal: AbortSignal.timeout(12000),
-      });
+      let token = await getH5Token(env);
+      if (!token) return null;
+
+      let response = await sendH5Request(env, endpoint, 'POST', body, token);
+
+      // Refresh an expired anonymous token and retry once.
+      if ([401, 403, 440].includes(response.status)) {
+        await invalidateH5Token(env);
+        token = await bootstrapH5Token(env);
+        if (token) response = await sendH5Request(env, endpoint, 'POST', body, token);
+      }
 
       if (!response.ok) {
-        console.warn(`[H5 Search] ${endpoint} returned HTTP ${response.status} — trying next`);
+        const message = (await response.text()).slice(0, 180).replace(/\\s+/g, ' ');
+        console.warn(`[H5 Search] ${endpoint} returned HTTP ${response.status}: ${message}`);
         continue;
       }
 
       const envelope = await response.json() as Record<string, any>;
       if (envelope.code !== undefined && Number(envelope.code) !== 0) {
-        console.warn(`[H5 Search] ${endpoint} returned API code ${envelope.code}: ${envelope.message ?? ''} — trying next`);
+        console.warn(`[H5 Search] ${endpoint} returned API code ${envelope.code}: ${envelope.message ?? ''}`);
         continue;
       }
 
       const data = envelope.data && typeof envelope.data === 'object'
         ? envelope.data as Record<string, any>
         : envelope;
-
-      // Some API builds wrap the catalogue object in a second data property.
       const unwrapped = data.data && typeof data.data === 'object'
         ? data.data as Record<string, any>
         : data;
 
-      console.log(`[H5 Search] Search succeeded via ${endpoint}`);
+      console.log(`[H5 Search] Search succeeded via ${new URL(endpoint).hostname}`);
       return unwrapped;
     } catch (error) {
       console.warn(`[H5 Search] ${endpoint} failed: ${error} — trying next`);
@@ -387,7 +526,7 @@ async function handleSearch(request: Request): Promise<Response> {
 
   // H5 search avoids the mobile API's bearer-token bootstrap, which currently
   // receives HTTP 440 across the Android host pool.
-  const data = await fetchH5Search(keyword, page, perPage);
+  const data = await fetchH5Search(env, keyword, page, perPage);
 
   if (!data) {
     return json({
@@ -406,6 +545,9 @@ async function handleSearch(request: Request): Promise<Response> {
 
   const items = rawItems
     .filter((item) => item && typeof item === 'object')
+    .map((item) => item.subject && typeof item.subject === 'object'
+      ? { ...item, ...item.subject }
+      : item)
     .filter((item) => String(item.subjectId ?? item.subject_id ?? item.id ?? '').trim() !== '')
     .filter((item) => String(item.title ?? item.name ?? '').trim() !== '')
     // Some responses serialize subjectType as a string. Treat a missing/unknown
