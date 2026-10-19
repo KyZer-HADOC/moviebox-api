@@ -458,7 +458,7 @@ async function fetchH5Search(
       }
 
       if (!response.ok) {
-        const message = (await response.text()).slice(0, 180).replace(/\\s+/g, ' ');
+        const message = (await response.text()).slice(0, 180).replace(/\s+/g, ' ');
         console.warn(`[H5 Search] ${endpoint} returned HTTP ${response.status}: ${message}`);
         continue;
       }
@@ -510,7 +510,7 @@ function handleRoot(): Response {
   });
 }
 
-async function handleSearch(request: Request): Promise<Response> {
+async function handleSearch(request: Request, env: Env): Promise<Response> {
   let body: Record<string, unknown>;
   try {
     body = await request.json() as Record<string, unknown>;
@@ -893,7 +893,7 @@ export default {
 
     // POST /search
     if (path === '/search' && request.method === 'POST') {
-      return handleSearch(request);
+      return handleSearch(request, env);
     }
 
     // GET /info/:subjectId
