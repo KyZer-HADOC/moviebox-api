@@ -292,10 +292,11 @@ function normalizeH5Subject(item: H5Subject) {
 const H5_API_BASE = 'https://h5-api.aoneroom.com';
 const H5_TOKEN_KEY = 'h5_auth_token';
 const H5_TOKEN_KV_TTL = 60 * 60 * 24;
-const H5_CLIENT_INFO = JSON.stringify({ timezone: 'Asia/Colombo' });
+// Match the current H5 web-client request headers used by the public frontend.
+const H5_CLIENT_INFO = JSON.stringify({ timezone: 'Africa/Nairobi' });
 const H5_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
+  '(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
 interface H5CachedToken {
   token: string;
@@ -377,6 +378,7 @@ async function sendH5Request(
     'Accept': accept,
     'User-Agent': H5_USER_AGENT,
     'Referer': 'https://themoviebox.org/',
+    'Origin': 'https://themoviebox.org',
     'X-Client-Token': await generateClientToken(timestamp),
     'x-tr-signature': await generateSignature(
       method, accept, contentType, url, body, timestamp
@@ -384,6 +386,12 @@ async function sendH5Request(
     'X-Client-Info': H5_CLIENT_INFO,
     'x-request-lang': 'en',
     'X-Client-Status': '0',
+    'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not A(Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'cross-site',
   };
   if (body !== null) headers['Content-Type'] = contentType;
   if (bearerToken) headers['Authorization'] = `Bearer ${bearerToken}`;
@@ -417,7 +425,8 @@ async function bootstrapH5Token(env: Env): Promise<string | null> {
         console.log(`[H5 Auth] Anonymous token bootstrap succeeded (HTTP ${response.status})`);
         return token;
       }
-      console.warn(`[H5 Auth] ${new URL(url).pathname} returned no x-user token (HTTP ${response.status})`);
+      const responseText = (await response.clone().text()).slice(0, 160).replace(/\s+/g, ' ');
+      console.warn(`[H5 Auth] ${new URL(url).pathname} returned no x-user token (HTTP ${response.status}); body=${responseText}`);
     } catch (error) {
       console.warn(`[H5 Auth] Bootstrap request failed: ${error}`);
     }
