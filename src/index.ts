@@ -647,7 +647,7 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
       }, 429);
     }
     return json({
-      error: 'MovieBox H5 search endpoints failed. Check the Worker logs for [H5 Search] errors.',
+      error: 'MovieBox search failed on both the Android and H5 APIs. Check Worker logs for [Search], [MovieBox], [Signing], and [H5 Search] errors.',
       keyword
     }, 502);
   }
