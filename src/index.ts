@@ -513,7 +513,7 @@ async function fetchH5Search(
     `${H5_API_BASE}/wefeed-h5api-bff/subject/search`,
     'https://h5.aoneroom.com/wefeed-h5api-bff/subject/search',
   ];
-  const body = JSON.stringify({ keyword, page, perPage, subjectType: 0 });
+  const body = JSON.stringify({ keyword, type: 0, page, pageSize: perPage });
 
   for (const endpoint of endpoints) {
     try {
@@ -600,9 +600,42 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
   const page = Math.max(1, Number(body.page ?? 1) || 1);
   const perPage = Math.min(20, Math.max(1, Number(body.perPage ?? 20) || 20));
 
-  // H5 search avoids the mobile API's bearer-token bootstrap, which currently
-  // receives HTTP 440 across the Android host pool.
-  const data = await fetchH5Search(env, keyword, page, perPage);
+  // Prefer the Android catalogue API. The mobile client now uses the current
+  // app identity, guest-token bootstrap, and v4 search payload. The H5 API is
+  // retained as a fallback because its upstream has recently rate-limited requests.
+  let data: Record<string, any> | null = null;
+  try {
+    const mobileData = await fetchWithHostPool<Record<string, any>>(
+      env,
+      PATHS.search,
+      'POST',
+      undefined,
+      { keyword, type: 0, page, pageSize: perPage }
+    );
+
+    if (mobileData && typeof mobileData === 'object') {
+      const nested = mobileData.data && typeof mobileData.data === 'object'
+        ? mobileData.data as Record<string, any>
+        : mobileData;
+      const hasList = ['items', 'list', 'subjects', 'results'].some(
+        (key) => Array.isArray(nested[key])
+      );
+      if (hasList) {
+        data = nested;
+        console.log('[Search] Android catalogue search succeeded');
+      } else {
+        console.warn('[Search] Android API returned an unrecognized response shape; trying H5');
+      }
+    } else {
+      console.warn('[Search] Android API returned no data; trying H5');
+    }
+  } catch (error) {
+    console.warn(`[Search] Android catalogue search failed: ${error} — trying H5`);
+  }
+
+  if (!data) {
+    data = await fetchH5Search(env, keyword, page, perPage);
+  }
 
   if (!data) {
     const retryAfterSeconds = await getH5CooldownRemaining(env);
