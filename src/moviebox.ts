@@ -23,6 +23,9 @@ import {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 export const HOST_POOL = [
+  // Current global BFF domains; retain the older regional mirrors as fallbacks.
+  'https://i-api.aoneroom.com',
+  'https://api.aoneroom.com',
   'https://api6.aoneroom.com',
   'https://api5.aoneroom.com',
   'https://api4.aoneroom.com',
