@@ -32,10 +32,10 @@ export const HOST_POOL = [
   'https://api.inmoviebox.com',
 ];
 
-const VERSION_CODE = 50020044;
-const VERSION_NAME = '3.0.03.0529.03';
+const VERSION_CODE = 50020126;
+const VERSION_NAME = '4.0.02.0831.03';
 const ANDROID_VERSION = '13';
-const ANDROID_BUILD = 'TQ2A.230405.003';
+const ANDROID_BUILD = 'TQ3A.230805.001';
 const DEVICE_MODEL = '23078RKD5C';
 const DEVICE_BRAND = 'Redmi';
 
@@ -110,7 +110,7 @@ async function buildHeaders(
   gaid?: string
 ): Promise<Record<string, string>> {
   const accept = 'application/json';
-  const contentType = body !== null ? 'application/json; charset=utf-8' : 'application/json';
+  const contentType = body !== null ? 'application/json;charset=UTF-8' : 'application/json';
   const ts = Date.now();
 
   const [token, signature] = await Promise.all([
@@ -120,6 +120,8 @@ async function buildHeaders(
 
   const headers: Record<string, string> = {
     'User-Agent':      USER_AGENT,
+    'X-M-Version':     '4.0.02',
+    'Referer':         'https://api6.aoneroom.com/',
     'Accept':          accept,
     'Content-Type':    contentType,
     'Connection':      'keep-alive',
@@ -191,7 +193,6 @@ async function attemptHostPool<T>(
       headers['X-Forwarded-For'] = nigeriaIp;
     }
     console.log(`[MovieBox Outgoing] URL: ${urlStr}`);
-    console.log(`[MovieBox Outgoing] Headers:`, JSON.stringify(headers));
 
     try {
       const activeFetch = (env as any).fetch || fetch;
@@ -290,7 +291,7 @@ export async function fetchWithHostPool<T>(
           env,
           PATHS.tabOperating,
           'GET',
-          { page: 1, tabId: 0, version: '' },
+          { host: 'api.inmoviebox.com', page: 1, pageSize: 24, tabId: 1 },
           null,
           null,
           nigeriaIp,
@@ -336,7 +337,7 @@ export async function fetchWithHostPool<T>(
           env,
           PATHS.tabOperating,
           'GET',
-          { page: 1, tabId: 0, version: '' },
+          { host: 'api.inmoviebox.com', page: 1, pageSize: 24, tabId: 1 },
           null,
           null,
           nigeriaIp,
